@@ -1,0 +1,81 @@
+name: Verify Pull Request
+on:
+  pull_request_target:
+    types:
+      - opened
+    branches:
+      - main
+
+jobs:
+  verify-pull-request:
+    runs-on: ubuntu-latest
+    env:
+      ADMIN_BOT_ENDPOINT: ${{secrets.ADMIN_BOT_ENDPOINT}}
+      GITHUB_USERNAME: ${{github.event.pull_request.user.login}}
+    steps:
+      - name: Fetch Sources
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          ref: ${{github.event.pull_request.head.ref}}
+          repository: ${{github.event.pull_request.head.repo.full_name}}
+
+      - id: changed-files
+        name: Detect Changed Files
+        uses: tj-actions/changed-files@v13.1
+        with:
+          separator: ','
+          sha: ${{github.event.pull_request.head.sha}}
+          base_sha: ${{github.event.pull_request.base.sha}}
+
+      # check if pull request has only allowed changes
+      - id: verification
+        name: Verify Pull Request
+        env:
+          ALL_CHANGES: ${{steps.changed-files.outputs.all_changed_and_modified_files}}
+          ADDED_CHANGES: ${{steps.changed-files.outputs.added_files}}
+        run: |
+          if [[ $ALL_CHANGES == *,* || $ALL_CHANGES != "$ADDED_CHANGES" || $ALL_CHANGES == "" ]]; then
+            echo "::set-output name=message::Pull request contains changes that are not allowed or does not contain any changes. This pull request will be manually reviewed and merged later."
+            echo "::set-output name=status::failure"
+          else
+            RANDOM_STRING=$(cat "$ADDED_CHANGES")
+            status_code=$(curl -i -G "$ADMIN_BOT_ENDPOINT/verify-random-string" --data-urlencode "random_string=$RANDOM_STRING" --data-urlencode "github=$GITHUB_USERNAME" | head -n 1 | cut -d$' ' -f2)
+            if [[ $status_code == 200 ]]; then
+              echo "::set-output name=message::Your pull request has been successfully verified."
+              echo "::set-output name=status::success"
+            elif [[ $status_code == 504 ]]; then
+              echo "::set-output name=message::Content of $ADDED_CHANGES is invalid."
+              echo "::set-output name=status::failure"
+            else
+              echo "::set-output name=message::Admin bot is busy or offline. Your pull request will be merged later."
+              echo "::set-output name=status::error"
+            fi
+          fi
+
+
+      - name: Respond to Pull request
+        uses: actions/github-script@v5
+        env:
+          status: ${{steps.verification.outputs.status}}
+          message: ${{steps.verification.outputs.message}}
+        with:
+          github-token: ${{ secrets.ADMIN_BOT_PAT }}
+          script: |
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: process.env.message,
+            })
+            
+            if(process.env.status == "success") {
+              await github.rest.pulls.merge({
+                pull_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                merge_method: "rebase",
+              })
+            }
+    
+          
